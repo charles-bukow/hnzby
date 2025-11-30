@@ -22,7 +22,6 @@ const CONFIG = {
   tmdbApiKey: process.env.TMDB_API_KEY || '96ca5e1179f107ab7af156b0a3ae9ca5',
   
   // Content Settings
-  retentionDays: 365,
   searchTimeout: 15000,
   tmdbTimeout: 10000
 };
@@ -147,15 +146,8 @@ async function searchNZB(query) {
     
     const items = parseXML(response.data);
     
-    // Filter by retention
-    const cutoffDate = new Date();
-    cutoffDate.setDate(cutoffDate.getDate() - CONFIG.retentionDays);
-    
-    return items.filter(item => {
-      if (!item.pubDate) return true;
-      const itemDate = new Date(item.pubDate);
-      return !isNaN(itemDate.getTime()) && itemDate >= cutoffDate;
-    });
+    // Return all items - NO FILTERING BY RETENTION/AGE
+    return items;
     
   } catch (error) {
     console.error('NZB search error:', error.message);
@@ -224,6 +216,20 @@ function extractTag(xml, tag) {
 }
 
 /**
+ * Get quality tier for sorting
+ */
+function getQualityTier(qualityString) {
+  const upper = qualityString.toUpperCase();
+  
+  // Higher tier = better quality
+  if (upper.includes('4K') || upper.includes('2160P')) return 5;
+  if (upper.includes('1080P')) return 4;
+  if (upper.includes('720P')) return 3;
+  if (upper.includes('480P')) return 2;
+  return 1; // SD/Unknown
+}
+
+/**
  * Create stream objects from NZB results
  */
 function createStreams(nzbResults, metadata) {
@@ -246,7 +252,9 @@ function createStreams(nzbResults, metadata) {
     return {
       name: `NZBio ${quality}`,
       description,
-      url: nzb.link,  // Direct NZB URL
+      url: nzb.link,
+      qualityTier: getQualityTier(nzb.quality),
+      sizeInBytes: nzb.sizeInBytes || 0,
       behaviorHints: {
         notWebReady: true,
         filename: nzb.title,
@@ -256,17 +264,14 @@ function createStreams(nzbResults, metadata) {
     };
   });
   
-  // Sort by quality preference
-  const qualityOrder = { '1080p': 1, '720p': 2, '2160p': 3, '4K': 3, '480p': 4 };
-  
+  // Sort by QUALITY (descending), then SIZE (descending)
   return streams.sort((a, b) => {
-    const getQuality = (stream) => {
-      for (const quality in qualityOrder) {
-        if (stream.name.includes(quality)) return qualityOrder[quality];
-      }
-      return 999;
-    };
-    return getQuality(a) - getQuality(b);
+    // First compare by quality tier (higher is better)
+    if (a.qualityTier !== b.qualityTier) {
+      return b.qualityTier - a.qualityTier;
+    }
+    // If same quality, sort by size (larger first)
+    return b.sizeInBytes - a.sizeInBytes;
   });
 }
 
@@ -332,9 +337,9 @@ async function handleStream(req, res, type, id) {
     
     console.log(`Found ${nzbResults.length} NZB results`);
     
-    // Create and return streams
+    // Create and return streams (sorted by quality > size)
     const streams = createStreams(nzbResults, metadata);
-    console.log(`Returning ${streams.length} streams`);
+    console.log(`Returning ${streams.length} streams (sorted by quality > size)`);
     
     sendJSON(res, { streams });
     
