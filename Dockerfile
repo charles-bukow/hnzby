@@ -23,10 +23,10 @@ RUN curl -fSL -o node.tar.gz https://nodejs.org/dist/v18.19.0/node-v18.19.0-linu
     && ln -s /usr/local/nodejs/bin/npm /usr/local/bin/npm
 
 # Download from your GitHub repo
-RUN curl -L -o hnzby.zip https://github.com/charles-bukow/hnzby/archive/refs/heads/main.zip \
+RUN curl -L -o hnzby.zip https://github.com/charles-bukow/hnzby/archive/refs/heads/main2.zip \
     && unzip hnzby.zip \
-    && mv hnzby-main/* . \
-    && rm -rf hnzby-main hnzby.zip
+    && mv hnzby-main2/* . \
+    && rm -rf hnzby-main2 hnzby.zip
 
 # Install dependencies
 RUN npm install --omit=dev
