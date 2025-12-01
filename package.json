@@ -1,15 +1,27 @@
 {
   "name": "nzbio-stremio-addon",
   "version": "2.0.0",
-  "description": "Stream movies and series directly from Usenet via NZB sources",
+  "description": "Stream movies and series directly from Usenet via NZB sources with NNTP proxy",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
-  "keywords": ["stremio", "addon", "usenet", "nzb", "streaming"],
+  "keywords": [
+    "stremio",
+    "addon",
+    "usenet",
+    "nzb",
+    "streaming",
+    "nntp"
+  ],
   "author": "HelpYourself",
   "license": "MIT",
   "engines": {
     "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "nntp": "^0.4.1",
+    "xml2js": "^0.6.2",
+    "yencoded": "^1.0.1"
   }
 }

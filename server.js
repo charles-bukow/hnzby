@@ -1,11 +1,14 @@
 // ============================================================================
-// NZBio Stremio Addon - Node.js Server for deploy.cx
-// Stream movies and series from Usenet via NZB Hydra
+// NZBio Stremio Addon - Node.js Server with NNTP Proxy
+// Stream movies and series from Usenet via NZB sources
 // ============================================================================
 
 const http = require('http');
 const https = require('https');
 const { URL } = require('url');
+const xml2js = require('xml2js');
+const nntp = require('nntp');
+const yencoded = require('yencoded');
 
 // ============================================================================
 // CONFIGURATION
@@ -21,10 +24,51 @@ const CONFIG = {
   // TMDB API Key
   tmdbApiKey: process.env.TMDB_API_KEY || '96ca5e1179f107ab7af156b0a3ae9ca5',
   
+  // NNTP Servers - Parse from environment or use defaults
+  nntpServers: parseNNTPServers(process.env.NNTP_SERVERS || 
+    'nntps://3F6591F2304B:U9ZfUr%25sX%5DW%3F%5D%2CdH%40Z_7@news.newsgroup.ninja:563/4,' +
+    'nntps://7b556e9dea40929b:v3jRQvKuy89URx3qD3@news.eweka.nl:563/4,' +
+    'nntps://uf19e250c9a87c061e7e:48493ff7a57f4178c64f90@news.usenet.farm:563/4,' +
+    'nntps://uf2bcd47415c28035462:778a7249cccf175fb5d114@news.usenet.farm:563/4,' +
+    'nntps://aiv575755466:287962398@news.newsgroupdirect.com:563/4,' +
+    'nntps://unp8736765:Br1lliant!P00p@news.usenetprime.com:563/4'
+  ),
+  
   // Content Settings
   searchTimeout: 15000,
-  tmdbTimeout: 10000
+  tmdbTimeout: 10000,
+  nzbTimeout: 30000,
+  proxyTimeout: 600000 // 10 minutes for video streaming
 };
+
+/**
+ * Parse NNTP server URIs into config objects
+ * Format: nntps://user:pass@host:port/connections
+ */
+function parseNNTPServers(serversString) {
+  const servers = serversString.split(',').map(uri => {
+    try {
+      const url = new URL(uri.trim());
+      return {
+        host: url.hostname,
+        port: parseInt(url.port) || 563,
+        secure: url.protocol === 'nntps:',
+        user: decodeURIComponent(url.username),
+        password: decodeURIComponent(url.password),
+        connections: parseInt(url.pathname.slice(1)) || 4
+      };
+    } catch (err) {
+      console.error('Failed to parse NNTP server URI:', uri, err.message);
+      return null;
+    }
+  }).filter(Boolean);
+  
+  if (servers.length === 0) {
+    console.error('No valid NNTP servers configured!');
+  }
+  
+  return servers;
+}
 
 // ============================================================================
 // MANIFEST
@@ -79,6 +123,121 @@ function makeRequest(url, options = {}) {
 }
 
 /**
+ * Download binary data (for NZB files)
+ */
+function downloadBinary(url) {
+  return new Promise((resolve, reject) => {
+    const urlObj = new URL(url);
+    const client = urlObj.protocol === 'https:' ? https : http;
+    
+    const timeout = setTimeout(() => {
+      reject(new Error('Download timeout'));
+    }, CONFIG.nzbTimeout);
+    
+    const req = client.get(url, (res) => {
+      clearTimeout(timeout);
+      
+      const chunks = [];
+      res.on('data', chunk => chunks.push(chunk));
+      res.on('end', () => resolve(Buffer.concat(chunks)));
+    });
+    
+    req.on('error', (err) => {
+      clearTimeout(timeout);
+      reject(err);
+    });
+  });
+}
+
+/**
+ * Parse NZB file
+ */
+async function parseNZB(nzbData) {
+  const parser = new xml2js.Parser();
+  const result = await parser.parseStringPromise(nzbData);
+  
+  const files = [];
+  
+  if (result.nzb && result.nzb.file) {
+    for (const file of result.nzb.file) {
+      const segments = [];
+      
+      if (file.segments && file.segments[0] && file.segments[0].segment) {
+        for (const segment of file.segments[0].segment) {
+          segments.push({
+            number: parseInt(segment.$.number),
+            bytes: parseInt(segment.$.bytes),
+            messageId: segment._
+          });
+        }
+      }
+      
+      // Sort segments by number
+      segments.sort((a, b) => a.number - b.number);
+      
+      files.push({
+        poster: file.$.poster || 'unknown',
+        date: file.$.date || '',
+        subject: file.$.subject || 'unknown',
+        segments: segments
+      });
+    }
+  }
+  
+  return files;
+}
+
+/**
+ * Connect to NNTP server
+ */
+function connectNNTP(serverConfig) {
+  return new Promise((resolve, reject) => {
+    const client = new nntp.NNTPClient(serverConfig.port, serverConfig.host, {
+      secure: serverConfig.secure
+    });
+    
+    client.on('connect', async () => {
+      try {
+        if (serverConfig.user && serverConfig.password) {
+          await client.authinfo(serverConfig.user, serverConfig.password);
+        }
+        resolve(client);
+      } catch (err) {
+        reject(err);
+      }
+    });
+    
+    client.on('error', reject);
+  });
+}
+
+/**
+ * Download article from NNTP
+ */
+async function downloadArticle(client, messageId) {
+  return new Promise((resolve, reject) => {
+    client.article(messageId, (err, responseCode, data) => {
+      if (err) return reject(err);
+      if (responseCode !== 220) return reject(new Error(`NNTP error: ${responseCode}`));
+      resolve(data);
+    });
+  });
+}
+
+/**
+ * Decode yEnc data
+ */
+function decodeYenc(data) {
+  try {
+    const decoded = yencoded.decode(data);
+    return decoded;
+  } catch (err) {
+    console.error('yEnc decode error:', err.message);
+    return null;
+  }
+}
+
+/**
  * Convert IMDb ID to TMDB metadata
  */
 async function getMetadata(imdbId) {
@@ -90,7 +249,6 @@ async function getMetadata(imdbId) {
     
     const data = JSON.parse(response.data);
     
-    // Check for movie
     if (data.movie_results?.length > 0) {
       const movie = data.movie_results[0];
       return {
@@ -101,7 +259,6 @@ async function getMetadata(imdbId) {
       };
     }
     
-    // Check for TV series
     if (data.tv_results?.length > 0) {
       const show = data.tv_results[0];
       return {
@@ -145,8 +302,6 @@ async function searchNZB(query) {
     }
     
     const items = parseXML(response.data);
-    
-    // Return all items - NO FILTERING BY RETENTION/AGE
     return items;
     
   } catch (error) {
@@ -170,14 +325,12 @@ function parseXML(xmlText) {
     const link = extractTag(itemContent, 'link');
     const pubDate = extractTag(itemContent, 'pubDate');
     
-    // Extract size
     let sizeInBytes = 0;
     const enclosureMatch = itemContent.match(/<enclosure[^>]*length="(\d+)"[^>]*>/i);
     if (enclosureMatch) {
       sizeInBytes = parseInt(enclosureMatch[1], 10);
     }
     
-    // Format size
     let size = 'Unknown';
     if (sizeInBytes > 1024 * 1024 * 1024) {
       size = `${(sizeInBytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
@@ -185,11 +338,9 @@ function parseXML(xmlText) {
       size = `${(sizeInBytes / (1024 * 1024)).toFixed(2)} MB`;
     }
     
-    // Extract quality markers
     const qualityRegex = /(4K|2160p|1080p|720p|480p|HDTV|WEB-DL|BluRay|HEVC|x265|H\.265|H264|x264)/gi;
     const qualityMatches = title.match(qualityRegex) || [];
     
-    // Extract category
     const category = extractTag(itemContent, 'category') || 'Unknown';
     
     items.push({
@@ -221,42 +372,41 @@ function extractTag(xml, tag) {
 function getQualityTier(qualityString) {
   const upper = qualityString.toUpperCase();
   
-  // Higher tier = better quality
   if (upper.includes('4K') || upper.includes('2160P')) return 5;
   if (upper.includes('1080P')) return 4;
   if (upper.includes('720P')) return 3;
   if (upper.includes('480P')) return 2;
-  return 1; // SD/Unknown
+  return 1;
 }
 
 /**
  * Create stream objects from NZB results
  */
-function createStreams(nzbResults, metadata) {
+function createStreams(nzbResults, metadata, baseUrl) {
   const streams = nzbResults.map(nzb => {
-    // Determine quality tier
     const qualityMatch = nzb.quality.match(/(4K|2160p|1080p|720p|480p)/i);
     const quality = qualityMatch ? qualityMatch[1] : 'SD';
     
-    // Build description
     const description = [
-      `📁 ${metadata.title}`,
-      `🎥 ${nzb.category}`,
-      `📦 ${nzb.size}`,
-      nzb.quality ? `🎬 ${nzb.quality}` : null
+      `Title: ${metadata.title}`,
+      `Category: ${nzb.category}`,
+      `Size: ${nzb.size}`,
+      nzb.quality ? `Quality: ${nzb.quality}` : null
     ].filter(Boolean).join('\n');
     
-    // Create binge group
     const bingeGroup = `org.stremio.nzbio|${quality.toLowerCase()}|${nzb.category.toLowerCase().replace(/\s+/g, '-')}`;
+    
+    // Use proxy URL instead of direct NZB link
+    const proxyUrl = `${baseUrl}/proxy?nzb=${encodeURIComponent(nzb.link)}`;
     
     return {
       name: `NZBio ${quality}`,
       description,
-      url: nzb.link,
+      url: proxyUrl,  // NNTP proxy URL
       qualityTier: getQualityTier(nzb.quality),
       sizeInBytes: nzb.sizeInBytes || 0,
       behaviorHints: {
-        notWebReady: true,
+        notWebReady: false,  // Now it IS web-ready via proxy
         filename: nzb.title,
         videoSize: nzb.sizeInBytes || undefined,
         bingeGroup
@@ -264,13 +414,10 @@ function createStreams(nzbResults, metadata) {
     };
   });
   
-  // Sort by QUALITY (descending), then SIZE (descending)
   return streams.sort((a, b) => {
-    // First compare by quality tier (higher is better)
     if (a.qualityTier !== b.qualityTier) {
       return b.qualityTier - a.qualityTier;
     }
-    // If same quality, sort by size (larger first)
     return b.sizeInBytes - a.sizeInBytes;
   });
 }
@@ -289,13 +436,11 @@ function handleManifest(req, res) {
 /**
  * Handle stream request
  */
-async function handleStream(req, res, type, id) {
+async function handleStream(req, res, type, id, baseUrl) {
   try {
-    // Decode URL-encoded ID
     const decodedId = decodeURIComponent(id);
     console.log(`Stream request: ${type}/${decodedId}`);
     
-    // Parse request
     let imdbId = decodedId;
     let season, episode;
     
@@ -308,7 +453,6 @@ async function handleStream(req, res, type, id) {
       return sendJSON(res, { streams: [] });
     }
     
-    // Get metadata from TMDB
     const metadata = await getMetadata(imdbId);
     if (!metadata) {
       console.log('No TMDB metadata found for:', imdbId);
@@ -317,7 +461,6 @@ async function handleStream(req, res, type, id) {
     
     console.log('Found metadata:', metadata.title, metadata.year);
     
-    // Build search query
     let searchQuery;
     if (type === 'movie') {
       searchQuery = `${metadata.title} ${metadata.year}`;
@@ -327,7 +470,6 @@ async function handleStream(req, res, type, id) {
     
     console.log('Searching NZB for:', searchQuery);
     
-    // Search NZB Hydra
     const nzbResults = await searchNZB(searchQuery);
     
     if (!nzbResults || nzbResults.length === 0) {
@@ -337,15 +479,94 @@ async function handleStream(req, res, type, id) {
     
     console.log(`Found ${nzbResults.length} NZB results`);
     
-    // Create and return streams (sorted by quality > size)
-    const streams = createStreams(nzbResults, metadata);
-    console.log(`Returning ${streams.length} streams (sorted by quality > size)`);
+    const streams = createStreams(nzbResults, metadata, baseUrl);
+    console.log(`Returning ${streams.length} streams`);
     
     sendJSON(res, { streams });
     
   } catch (error) {
     console.error('Stream handler error:', error);
     sendJSON(res, { streams: [] });
+  }
+}
+
+/**
+ * Handle NNTP proxy request
+ */
+async function handleProxy(req, res, nzbUrl) {
+  try {
+    console.log('Proxy request for NZB:', nzbUrl);
+    
+    // Download NZB file
+    console.log('Downloading NZB...');
+    const nzbData = await downloadBinary(nzbUrl);
+    
+    // Parse NZB
+    console.log('Parsing NZB...');
+    const files = await parseNZB(nzbData);
+    
+    if (!files || files.length === 0) {
+      throw new Error('No files found in NZB');
+    }
+    
+    console.log(`Found ${files.length} file(s) in NZB`);
+    
+    // Find the largest video file (usually the main video)
+    const videoFile = files.reduce((largest, file) => {
+      const fileSize = file.segments.reduce((sum, seg) => sum + seg.bytes, 0);
+      const largestSize = largest ? largest.segments.reduce((sum, seg) => sum + seg.bytes, 0) : 0;
+      return fileSize > largestSize ? file : largest;
+    }, null);
+    
+    if (!videoFile) {
+      throw new Error('No video file found');
+    }
+    
+    console.log(`Streaming file: ${videoFile.subject} (${videoFile.segments.length} segments)`);
+    
+    // Connect to NNTP
+    console.log('Connecting to NNTP...');
+    const nntpClient = await connectNNTP(CONFIG.nntpServers[0]);
+    
+    // Set response headers for video streaming
+    res.writeHead(200, {
+      'Content-Type': 'video/mp4',
+      'Accept-Ranges': 'bytes',
+      'Access-Control-Allow-Origin': '*',
+      'Cache-Control': 'no-cache'
+    });
+    
+    // Download and stream segments
+    for (let i = 0; i < videoFile.segments.length; i++) {
+      const segment = videoFile.segments[i];
+      
+      console.log(`Downloading segment ${i + 1}/${videoFile.segments.length}: ${segment.messageId}`);
+      
+      try {
+        const articleData = await downloadArticle(nntpClient, segment.messageId);
+        const decodedData = decodeYenc(articleData);
+        
+        if (decodedData) {
+          res.write(decodedData);
+        } else {
+          console.error(`Failed to decode segment ${i + 1}`);
+        }
+      } catch (err) {
+        console.error(`Error downloading segment ${i + 1}:`, err.message);
+        // Continue with next segment
+      }
+    }
+    
+    // Close connection
+    nntpClient.quit();
+    res.end();
+    
+    console.log('Stream complete');
+    
+  } catch (error) {
+    console.error('Proxy error:', error);
+    res.writeHead(500, { 'Content-Type': 'text/plain' });
+    res.end(`Error: ${error.message}`);
   }
 }
 
@@ -371,6 +592,9 @@ const server = http.createServer((req, res) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
   const path = url.pathname;
   
+  // Get base URL for proxy links
+  const baseUrl = `http://${req.headers.host}`;
+  
   // Handle CORS preflight
   if (req.method === 'OPTIONS') {
     res.writeHead(204, {
@@ -386,11 +610,21 @@ const server = http.createServer((req, res) => {
     return handleManifest(req, res);
   }
   
+  // Route: /proxy?nzb=<url>
+  if (path === '/proxy') {
+    const nzbUrl = url.searchParams.get('nzb');
+    if (!nzbUrl) {
+      res.writeHead(400, { 'Content-Type': 'text/plain' });
+      return res.end('Missing nzb parameter');
+    }
+    return handleProxy(req, res, decodeURIComponent(nzbUrl));
+  }
+  
   // Route: /stream/:type/:id.json
   const streamMatch = path.match(/^\/stream\/(movie|series)\/([^\/]+)\.json$/);
   if (streamMatch) {
     const [, type, id] = streamMatch;
-    return handleStream(req, res, type, id);
+    return handleStream(req, res, type, id, baseUrl);
   }
   
   // Default: return manifest
@@ -399,6 +633,7 @@ const server = http.createServer((req, res) => {
 
 // Start server
 server.listen(CONFIG.port, '0.0.0.0', () => {
-  console.log(`NZBio Stremio Addon running on port ${CONFIG.port}`);
+  console.log(`NZBio Stremio Addon with NNTP Proxy running on port ${CONFIG.port}`);
   console.log(`Manifest: http://localhost:${CONFIG.port}/manifest.json`);
+  console.log(`Proxy: http://localhost:${CONFIG.port}/proxy?nzb=<url>`);
 });
