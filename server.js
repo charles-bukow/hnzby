@@ -1,6 +1,6 @@
 // ============================================================================
-// NZBio Stremio Addon - Node.js Server for deploy.cx
-// Stream movies and series from Usenet via NZB Hydra
+// NZBio Stremio Addon - Node.js Server (Direct Indexer Edition)
+// Stream movies and series from Usenet via direct indexer API calls
 // ============================================================================
 
 const http = require('http');
@@ -12,18 +12,45 @@ const { URL } = require('url');
 // ============================================================================
 
 const CONFIG = {
-  port: process.env.PORT || 80,
-  
-  // NZB Hydra Settings
-  hydraUrl: process.env.HYDRA_URL || 'http://nzbhy.duckdns.org:31013',
-  hydraApiKey: process.env.HYDRA_API_KEY || '5CB1HJJFVNV31AQ23M089DP3BN',
+  // Direct Indexers
+  indexers: [
+    {
+      name: 'NZBPlanet',
+      url: 'https://nzbplanet.net/api',
+      apiKey: 'bacb2bb2b6e39031c8cc87d541eb2208'
+    },
+    {
+      name: 'DrunkenSlug',
+      url: 'https://drunkenslug.com/api',
+      apiKey: '1ea43e3299e9d7f8197e47cbf54339ad'
+    },
+    {
+      name: 'NZBGeek',
+      url: 'https://api.nzbgeek.info/api',
+      apiKey: 'D82cPAexiYCGwVPr2AOWusCR1830ls2y'
+    }
+  ],
   
   // TMDB API Key
-  tmdbApiKey: process.env.TMDB_API_KEY || '96ca5e1179f107ab7af156b0a3ae9ca5',
+  tmdbApiKey: '96ca5e1179f107ab7af156b0a3ae9ca5',
+  
+  // NNTP Servers
+  nntpServers: [
+    'nntps://3F6591F2304B:U9ZfUr%25sX%5DW%3F%5D%2CdH%40Z_7@news.newsgroup.ninja:563/4',
+    'nntps://7b556e9dea40929b:v3jRQvKuy89URx3qD3@news.eweka.nl:563/4',
+    'nntps://uf19e250c9a87c061e7e:48493ff7a57f4178c64f90@news.usenet.farm:563/4',
+    'nntps://uf2bcd47415c28035462:778a7249cccf175fb5d114@news.usenet.farm:563/4',
+    'nntps://aiv575755466:287962398@news.newsgroupdirect.com:563/4',
+    'nntps://unp8736765:Br1lliant!P00p@news.usenetprime.com:563/4'
+  ],
   
   // Content Settings
+  retentionDays: 365,
   searchTimeout: 15000,
-  tmdbTimeout: 10000
+  tmdbTimeout: 10000,
+  
+  // Server Settings
+  port: process.env.PORT || 80
 };
 
 // ============================================================================
@@ -31,10 +58,10 @@ const CONFIG = {
 // ============================================================================
 
 const MANIFEST = {
-  id: 'org.stremio.nzbio.deploycx',
-  name: 'NZBio',
-  version: '2.0.0',
-  description: 'Stream movies and series directly from Usenet via NZB sources',
+  id: 'org.stremio.nzbio.direct',
+  name: 'NZBio Direct',
+  version: '3.0.0',
+  description: 'Stream from Usenet via direct indexer connections (no Hydra)',
   resources: ['stream'],
   types: ['movie', 'series'],
   idPrefixes: ['tt'],
@@ -52,27 +79,31 @@ const MANIFEST = {
 // ============================================================================
 
 /**
- * Make HTTP(S) request
+ * Make HTTPS request with timeout
  */
-function makeRequest(url, options = {}) {
+function httpsGet(url, timeout = 10000) {
   return new Promise((resolve, reject) => {
-    const urlObj = new URL(url);
-    const client = urlObj.protocol === 'https:' ? https : http;
-    
-    const timeout = setTimeout(() => {
+    const timer = setTimeout(() => {
+      req.destroy();
       reject(new Error('Request timeout'));
-    }, options.timeout || 15000);
-    
-    const req = client.get(url, options, (res) => {
-      clearTimeout(timeout);
-      
+    }, timeout);
+
+    const req = https.get(url, { headers: { 'User-Agent': 'NZBio/3.0' } }, (res) => {
+      clearTimeout(timer);
       let data = '';
+      
       res.on('data', chunk => data += chunk);
-      res.on('end', () => resolve({ status: res.statusCode, data }));
+      res.on('end', () => {
+        if (res.statusCode === 200) {
+          resolve(data);
+        } else {
+          reject(new Error(`HTTP ${res.statusCode}`));
+        }
+      });
     });
-    
+
     req.on('error', (err) => {
-      clearTimeout(timeout);
+      clearTimeout(timer);
       reject(err);
     });
   });
@@ -84,15 +115,12 @@ function makeRequest(url, options = {}) {
 async function getMetadata(imdbId) {
   try {
     const url = `https://api.themoviedb.org/3/find/${imdbId}?api_key=${CONFIG.tmdbApiKey}&external_source=imdb_id`;
-    const response = await makeRequest(url, { timeout: CONFIG.tmdbTimeout });
-    
-    if (response.status !== 200) return null;
-    
-    const data = JSON.parse(response.data);
+    const data = await httpsGet(url, CONFIG.tmdbTimeout);
+    const json = JSON.parse(data);
     
     // Check for movie
-    if (data.movie_results?.length > 0) {
-      const movie = data.movie_results[0];
+    if (json.movie_results?.length > 0) {
+      const movie = json.movie_results[0];
       return {
         tmdbId: movie.id,
         title: movie.title,
@@ -102,8 +130,8 @@ async function getMetadata(imdbId) {
     }
     
     // Check for TV series
-    if (data.tv_results?.length > 0) {
-      const show = data.tv_results[0];
+    if (json.tv_results?.length > 0) {
+      const show = json.tv_results[0];
       return {
         tmdbId: show.id,
         title: show.name,
@@ -120,43 +148,77 @@ async function getMetadata(imdbId) {
 }
 
 /**
- * Search NZB Hydra for content
+ * Search a single indexer
  */
-async function searchNZB(query) {
+async function searchIndexer(indexer, query) {
   try {
-    const apiUrl = CONFIG.hydraUrl.endsWith('/api') 
-      ? CONFIG.hydraUrl 
-      : `${CONFIG.hydraUrl}/api`;
+    const searchUrl = `${indexer.url}?apikey=${indexer.apiKey}&t=search&q=${encodeURIComponent(query)}&extended=1`;
     
-    const searchUrl = `${apiUrl}?apikey=${CONFIG.hydraApiKey}&t=search&q=${encodeURIComponent(query)}`;
+    console.log(`Searching ${indexer.name}...`);
     
-    const response = await makeRequest(searchUrl, {
-      timeout: CONFIG.searchTimeout,
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        'Accept': 'application/xml, application/rss+xml, text/xml',
-        'Accept-Language': 'en-US,en;q=0.9'
-      }
-    });
+    const xmlText = await httpsGet(searchUrl, CONFIG.searchTimeout);
+    const items = parseXML(xmlText);
     
-    if (response.status !== 200) {
-      console.error(`NZB search failed: ${response.status}`);
-      return [];
-    }
+    console.log(`${indexer.name} returned ${items.length} results`);
     
-    const items = parseXML(response.data);
-    
-    // Return all items - NO FILTERING BY RETENTION/AGE
-    return items;
+    // Tag items with indexer name
+    return items.map(item => ({
+      ...item,
+      indexer: indexer.name
+    }));
     
   } catch (error) {
-    console.error('NZB search error:', error.message);
+    console.error(`${indexer.name} error:`, error.message);
     return [];
   }
 }
 
 /**
- * Parse XML response from NZB Hydra
+ * Search all indexers in parallel
+ */
+async function searchAllIndexers(query) {
+  try {
+    console.log(`Searching all indexers for: "${query}"`);
+    
+    // Search all indexers simultaneously
+    const results = await Promise.all(
+      CONFIG.indexers.map(indexer => searchIndexer(indexer, query))
+    );
+    
+    // Flatten all results
+    const allItems = results.flat();
+    
+    console.log(`Total results from all indexers: ${allItems.length}`);
+    
+    // Remove duplicates by title
+    const uniqueItems = Array.from(
+      new Map(allItems.map(item => [item.title.toLowerCase(), item])).values()
+    );
+    
+    console.log(`Unique results after deduplication: ${uniqueItems.length}`);
+    
+    // Filter by retention
+    const cutoffDate = new Date();
+    cutoffDate.setDate(cutoffDate.getDate() - CONFIG.retentionDays);
+    
+    const filtered = uniqueItems.filter(item => {
+      if (!item.pubDate) return true;
+      const itemDate = new Date(item.pubDate);
+      return !isNaN(itemDate.getTime()) && itemDate >= cutoffDate;
+    });
+    
+    console.log(`Results after retention filter: ${filtered.length}`);
+    
+    return filtered;
+    
+  } catch (error) {
+    console.error('Search all indexers error:', error.message);
+    return [];
+  }
+}
+
+/**
+ * Parse XML response from indexers
  */
 function parseXML(xmlText) {
   const items = [];
@@ -207,26 +269,21 @@ function parseXML(xmlText) {
 }
 
 /**
- * Extract XML tag value
+ * Extract XML tag value and decode HTML entities
  */
 function extractTag(xml, tag) {
   const regex = new RegExp(`<${tag}[^>]*>([\\s\\S]*?)<\\/${tag}>`, 'i');
   const match = xml.match(regex);
-  return match ? match[1].trim() : '';
-}
-
-/**
- * Get quality tier for sorting
- */
-function getQualityTier(qualityString) {
-  const upper = qualityString.toUpperCase();
+  if (!match) return '';
   
-  // Higher tier = better quality
-  if (upper.includes('4K') || upper.includes('2160P')) return 5;
-  if (upper.includes('1080P')) return 4;
-  if (upper.includes('720P')) return 3;
-  if (upper.includes('480P')) return 2;
-  return 1; // SD/Unknown
+  // Decode HTML entities
+  const value = match[1].trim();
+  return value
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'");
 }
 
 /**
@@ -240,21 +297,21 @@ function createStreams(nzbResults, metadata) {
     
     // Build description
     const description = [
-      `📁 ${metadata.title}`,
+      `📺 ${metadata.title}`,
+      `🔍 ${nzb.indexer}`,
       `🎥 ${nzb.category}`,
       `📦 ${nzb.size}`,
       nzb.quality ? `🎬 ${nzb.quality}` : null
     ].filter(Boolean).join('\n');
     
     // Create binge group
-    const bingeGroup = `org.stremio.nzbio|${quality.toLowerCase()}|${nzb.category.toLowerCase().replace(/\s+/g, '-')}`;
+    const bingeGroup = `org.stremio.nzbio.direct|${quality.toLowerCase()}|${nzb.category.toLowerCase().replace(/\s+/g, '-')}`;
     
     return {
-      name: `NZBio ${quality}`,
+      name: `NZB ${quality} [${nzb.indexer}]`,
       description,
-      url: nzb.link,
-      qualityTier: getQualityTier(nzb.quality),
-      sizeInBytes: nzb.sizeInBytes || 0,
+      nzbUrl: nzb.link,
+      servers: CONFIG.nntpServers,
       behaviorHints: {
         notWebReady: true,
         filename: nzb.title,
@@ -264,14 +321,17 @@ function createStreams(nzbResults, metadata) {
     };
   });
   
-  // Sort by QUALITY (descending), then SIZE (descending)
+  // Sort by quality preference
+  const qualityOrder = { '1080p': 1, '720p': 2, '2160p': 3, '4K': 3, '480p': 4 };
+  
   return streams.sort((a, b) => {
-    // First compare by quality tier (higher is better)
-    if (a.qualityTier !== b.qualityTier) {
-      return b.qualityTier - a.qualityTier;
-    }
-    // If same quality, sort by size (larger first)
-    return b.sizeInBytes - a.sizeInBytes;
+    const getQuality = (stream) => {
+      for (const quality in qualityOrder) {
+        if (stream.name.includes(quality)) return qualityOrder[quality];
+      }
+      return 999;
+    };
+    return getQuality(a) - getQuality(b);
   });
 }
 
@@ -280,20 +340,20 @@ function createStreams(nzbResults, metadata) {
 // ============================================================================
 
 /**
- * Handle manifest request
+ * Handle manifest.json request
  */
-function handleManifest(req, res) {
-  sendJSON(res, MANIFEST);
+function handleManifest() {
+  return MANIFEST;
 }
 
 /**
  * Handle stream request
  */
-async function handleStream(req, res, type, id) {
+async function handleStream(type, id) {
   try {
     // Decode URL-encoded ID
     const decodedId = decodeURIComponent(id);
-    console.log(`Stream request: ${type}/${decodedId}`);
+    console.log(`\n=== Stream Request: ${type}/${decodedId} ===`);
     
     // Parse request
     let imdbId = decodedId;
@@ -305,17 +365,18 @@ async function handleStream(req, res, type, id) {
     
     if (!imdbId.startsWith('tt')) {
       console.log('Invalid IMDb ID:', imdbId);
-      return sendJSON(res, { streams: [] });
+      return { streams: [] };
     }
     
     // Get metadata from TMDB
+    console.log('Fetching TMDB metadata...');
     const metadata = await getMetadata(imdbId);
     if (!metadata) {
-      console.log('No TMDB metadata found for:', imdbId);
-      return sendJSON(res, { streams: [] });
+      console.log('No TMDB metadata found');
+      return { streams: [] };
     }
     
-    console.log('Found metadata:', metadata.title, metadata.year);
+    console.log(`Found: ${metadata.title} (${metadata.year})`);
     
     // Build search query
     let searchQuery;
@@ -325,80 +386,101 @@ async function handleStream(req, res, type, id) {
       searchQuery = `${metadata.title} S${season.padStart(2, '0')}E${episode.padStart(2, '0')}`;
     }
     
-    console.log('Searching NZB for:', searchQuery);
+    console.log(`Search query: "${searchQuery}"`);
     
-    // Search NZB Hydra
-    const nzbResults = await searchNZB(searchQuery);
+    // Search all indexers
+    const nzbResults = await searchAllIndexers(searchQuery);
     
     if (!nzbResults || nzbResults.length === 0) {
-      console.log('No NZB results found');
-      return sendJSON(res, { streams: [] });
+      console.log('No results found from any indexer');
+      return { streams: [] };
     }
     
-    console.log(`Found ${nzbResults.length} NZB results`);
-    
-    // Create and return streams (sorted by quality > size)
+    // Create and return streams
     const streams = createStreams(nzbResults, metadata);
-    console.log(`Returning ${streams.length} streams (sorted by quality > size)`);
+    console.log(`Returning ${streams.length} streams to Stremio`);
+    console.log('=== Request Complete ===\n');
     
-    sendJSON(res, { streams });
+    return { streams };
     
   } catch (error) {
     console.error('Stream handler error:', error);
-    sendJSON(res, { streams: [] });
+    return { streams: [] };
   }
-}
-
-/**
- * Send JSON response
- */
-function sendJSON(res, data) {
-  res.writeHead(200, {
-    'Content-Type': 'application/json; charset=utf-8',
-    'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-    'Access-Control-Allow-Headers': '*',
-    'Cache-Control': 'no-cache'
-  });
-  res.end(JSON.stringify(data));
 }
 
 // ============================================================================
 // HTTP SERVER
 // ============================================================================
 
-const server = http.createServer((req, res) => {
-  const url = new URL(req.url, `http://${req.headers.host}`);
-  const path = url.pathname;
+const server = http.createServer(async (req, res) => {
+  // CORS headers
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', '*');
+  res.setHeader('Access-Control-Max-Age', '86400');
+  res.setHeader('Content-Type', 'application/json; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-cache');
   
   // Handle CORS preflight
   if (req.method === 'OPTIONS') {
-    res.writeHead(204, {
-      'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-      'Access-Control-Allow-Headers': '*'
-    });
-    return res.end();
+    res.writeHead(204);
+    res.end();
+    return;
   }
   
-  // Route: /manifest.json or /
-  if (path === '/manifest.json' || path === '/') {
-    return handleManifest(req, res);
-  }
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  const path = url.pathname;
   
-  // Route: /stream/:type/:id.json
-  const streamMatch = path.match(/^\/stream\/(movie|series)\/([^\/]+)\.json$/);
-  if (streamMatch) {
-    const [, type, id] = streamMatch;
-    return handleStream(req, res, type, id);
+  try {
+    // Route: /manifest.json
+    if (path === '/manifest.json' || path === '/') {
+      const manifest = handleManifest();
+      res.writeHead(200);
+      res.end(JSON.stringify(manifest));
+      return;
+    }
+    
+    // Route: /stream/:type/:id.json
+    const streamMatch = path.match(/^\/stream\/(movie|series)\/([^\/]+)\.json$/);
+    if (streamMatch) {
+      const [, type, id] = streamMatch;
+      const result = await handleStream(type, id);
+      res.writeHead(200);
+      res.end(JSON.stringify(result));
+      return;
+    }
+    
+    // Default: return manifest
+    const manifest = handleManifest();
+    res.writeHead(200);
+    res.end(JSON.stringify(manifest));
+    
+  } catch (error) {
+    console.error('Server error:', error);
+    res.writeHead(500);
+    res.end(JSON.stringify({ error: 'Internal server error' }));
   }
-  
-  // Default: return manifest
-  handleManifest(req, res);
 });
 
-// Start server
-server.listen(CONFIG.port, '0.0.0.0', () => {
-  console.log(`NZBio Stremio Addon running on port ${CONFIG.port}`);
-  console.log(`Manifest: http://localhost:${CONFIG.port}/manifest.json`);
+// ============================================================================
+// START SERVER
+// ============================================================================
+
+server.listen(CONFIG.port, () => {
+  console.log('');
+  console.log('╔════════════════════════════════════════════════════════════╗');
+  console.log('║           NZBio Direct - Stremio Addon Server             ║');
+  console.log('╠════════════════════════════════════════════════════════════╣');
+  console.log(`║  Server running on port: ${CONFIG.port}${' '.repeat(32 - CONFIG.port.toString().length)}║`);
+  console.log(`║  Manifest URL: http://localhost:${CONFIG.port}/manifest.json${' '.repeat(12 - CONFIG.port.toString().length)}║`);
+  console.log('║                                                            ║');
+  console.log(`║  Indexers configured: ${CONFIG.indexers.length}${' '.repeat(33)}║`);
+  CONFIG.indexers.forEach(indexer => {
+    console.log(`║    - ${indexer.name}${' '.repeat(50 - indexer.name.length)}║`);
+  });
+  console.log('║                                                            ║');
+  console.log('║  Ready to stream from Usenet! 🚀                          ║');
+  console.log('╚════════════════════════════════════════════════════════════╝');
+  console.log('');
 });
